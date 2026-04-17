@@ -15,40 +15,38 @@ from imblearn.over_sampling import SMOTE
 import shap
 import matplotlib.pyplot as plt
 
-def create_dataset():
-    print("Creating fresh dataset...")
+def load_dataset():
+    try:
+        df = pd.read_csv("tox21_sample.csv")
+        print("Loaded real dataset")
+    except:
+        print("Using demo dataset")
+        smiles = [
+            "CCO","CCC","COC","CCOCC","CCCl","CCBr","C#N",
+            "CCN","CCCN","CCClC","CCS","CN","CCNCC",
+            "CC1=CC=C(C=C1)N=NC2=CC=CC=C2"
+        ]
+        toxicity = [0,0,0,0,1,1,1,1,1,1,1,1,1,1]
+        df = pd.DataFrame({"SMILES": smiles, "Toxicity": toxicity})
 
-    smiles = [
-        # NON-TOXIC
-        "CCO","CCC","COC","CCOCC","CCCO","CO","CCOCCC","COCC",
-        "CC(C)O","CCOC(=O)C","CCOCCO",
+    return df
 
-        # TOXIC
-        "CCCl","CCBr","C#N","CCN","CCCN","CCClC","CCBrC","CCS",
-        "CN","CCNCC","CCClCC","CCBrCC","CCF","CCFCCC",
-
-        # AZO (toxic)
-        "CCN=NC","N=N",
-        "CC1=CC=C(C=C1)N=NC2=CC=CC=C2"
-    ]
-
-    toxicity = [0]*11 + [1]*14 + [1]*3
-
-    df = pd.DataFrame({"SMILES": smiles, "Toxicity": toxicity})
-    df.to_csv("toxicity_data.csv", index=False)
-
-def features(smiles):
+def featurize(smiles):
     mol = Chem.MolFromSmiles(smiles)
     if mol:
         fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=256)
         fp = np.array(fp)
 
-        num_atoms = mol.GetNumAtoms()
-        num_bonds = mol.GetNumBonds()
+        descriptors = [
+            mol.GetNumAtoms(),
+            mol.GetNumBonds(),
+            Chem.rdMolDescriptors.CalcTPSA(mol),
+            Chem.rdMolDescriptors.CalcExactMolWt(mol)
+        ]
 
-        return np.concatenate([fp, [num_atoms, num_bonds]])
+        return np.concatenate([fp, descriptors])
 
-    return np.zeros(258)
+    return np.zeros(260)
 
 def azo_break(smiles):
     mol = Chem.MolFromSmiles(smiles)
@@ -63,83 +61,110 @@ def azo_break(smiles):
 
     return []
 
-def train(X, y):
+def mixture_features(sm1, sm2):
+    f1 = featurize(sm1)
+    f2 = featurize(sm2)
+
+    concat = np.concatenate([f1, f2])
+    diff = np.abs(f1 - f2)
+    mult = f1 * f2
+
+    return np.concatenate([concat, diff, mult])
+
+def train_model(X, y):
     counter = Counter(y)
     print("Class distribution:", counter)
 
     min_samples = min(counter.values())
 
     if min_samples > 1:
-        k = min(5, min_samples - 1)
+        k = min(5, min_samples - 1)  # FIXED
+        print(f"Using SMOTE with k_neighbors={k}")
+
         smote = SMOTE(k_neighbors=k, random_state=42)
         X, y = smote.fit_resample(X, y)
+    else:
+        print("Skipping SMOTE (not enough samples)")
 
     model = XGBClassifier(
         eval_metric='logloss',
-        max_depth=4,
-        n_estimators=150,
-        learning_rate=0.1
+        max_depth=5,
+        n_estimators=200,
+        learning_rate=0.05
     )
 
     model.fit(X, y)
     return model
 
+def train_mixture_model(df):
+    mixtures = []
+    labels = []
+
+    for i in range(len(df)):
+        for j in range(i+1, len(df)):
+            sm1 = df.iloc[i]["SMILES"]
+            sm2 = df.iloc[j]["SMILES"]
+
+            mixtures.append(mixture_features(sm1, sm2))
+
+            label = max(df.iloc[i]["Toxicity"], df.iloc[j]["Toxicity"])
+            labels.append(label)
+
+    X = np.array(mixtures)
+    y = np.array(labels)
+
+    return train_model(X, y)
+
 def main():
-    print("Starting AI Toxicity System")
+    print("AI Toxicity Research System")
 
-    # FORCE NEW DATASET
-    create_dataset()
-
-    data = pd.read_csv("toxicity_data.csv")
-
-    print("\nDataset size:", len(data))
-    print(data['Toxicity'].value_counts())
-
-    X = np.array([features(s) for s in data['SMILES']])
-    y = data['Toxicity'].values
+    df = load_dataset()
+    X = np.array([featurize(s) for s in df["SMILES"]])
+    y = df["Toxicity"].values
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.25, random_state=42
+        X, y, test_size=0.3, random_state=42
     )
 
-    model = train(X_train, y_train)
+    model = train_model(X_train, y_train)
+
     y_pred = model.predict(X_test)
 
-    acc = accuracy_score(y_test, y_pred)
-    print("\nAccuracy:", acc)
-
+    print("\nAccuracy:", accuracy_score(y_test, y_pred))
     print("\nReport:\n", classification_report(y_test, y_pred, zero_division=0))
 
     cm = confusion_matrix(y_test, y_pred)
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
-    disp.plot()
+    ConfusionMatrixDisplay(cm).plot()
     plt.title("Confusion Matrix")
     plt.show()
 
-    importances = model.feature_importances_
-    indices = np.argsort(importances)[-10:]
-
-    plt.barh(range(10), importances[indices])
-    plt.yticks(range(10), indices)
-    plt.title("Top Feature Importance")
-    plt.show()
-
     explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X_train[:100])
-    shap.summary_plot(shap_values, X_train[:100])
-
+    shap_values = explainer.shap_values(X_train[:50])
+    shap.summary_plot(shap_values, X_train[:50])
     test = "CC1=CC=C(C=C1)N=NC2=CC=CC=C2"
-    print("\nTesting:", test)
 
-    pred = model.predict(features(test).reshape(1, -1))
+    print("\nTest molecule:", test)
+
+    pred = model.predict(featurize(test).reshape(1, -1))
     print("Original:", "Toxic" if pred[0] else "Non-Toxic")
 
     products = azo_break(test)
-    print("\nProducts:", products)
+    print("Products:", products)
 
     for p in products:
-        pred = model.predict(features(p).reshape(1, -1))
+        pred = model.predict(featurize(p).reshape(1, -1))
         print(p, "→", "Toxic" if pred[0] else "Non-Toxic")
+    print("\n--- Mixture Toxicity ---")
+
+    mix_model = train_mixture_model(df)
+
+    mol1 = "CCCl"
+    mol2 = "CCO"
+
+    mix_feat = mixture_features(mol1, mol2).reshape(1, -1)
+    mix_pred = mix_model.predict(mix_feat)
+
+    print(f"{mol1} + {mol2} →", "Toxic" if mix_pred[0] else "Non-Toxic")
 
 if __name__ == "__main__":
     main()
